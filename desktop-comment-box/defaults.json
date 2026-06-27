@@ -1,0 +1,14 @@
+{
+  "title": "New Box",
+  "width": 769,
+  "height": 538,
+  "background": "rgba(116,116,120,0.2)",
+  "border": "rgba(192,191,188,0.7)",
+  "title_color": "rgb(255,255,255)",
+  "label_color": "rgb(255,255,255)",
+  "hover": "rgb(255,255,255)",
+  "window_opacity": 1.0,
+  "icon_size": 48,
+  "show_hidden": false,
+  "per_workspace": true
+}

@@ -1,206 +1,99 @@
 # Desktop Comment Box GTK
 
-DISCLAIMER: THIS IS ENTIRELY AI GENERATED
+DISCLAIMER: This is entirely AI generated
 
-
-Desktop Comment Box GTK is a Linux Mint Cinnamon utility for grouping desktop icons inside movable, resizable, Blueprint-style comment boxes.
-
-It is a small GTK 3 desktop app, not a Cinnamon desklet. That matters because GTK can receive real file-manager drag/drop events from Nemo, while Cinnamon desklets cannot reliably receive external desktop/file-manager drops.
+Desktop Comment Box GTK creates draggable, resizable desktop icon containers for Linux Mint/Cinnamon. It is meant to behave like a desktop version of UE-style comment boxes: group files visually, drag files in and out, move icons on a grid, and capture selected desktop icons into a new box.
 
 ## Features
 
-- Movable and resizable desktop comment boxes.
-- Drag files, folders, and launchers from Nemo/Desktop into a box.
-- Drag icons out of a box back to the Desktop.
-- Drag icons from one box into another box.
+- Drag files/folders/launchers into a comment box.
+- Drag files out of a box back to the desktop.
 - Move icons inside a box with grid snapping.
-- Rename boxes by double-clicking the title.
-- Configure appearance per box.
-- Save an appearance as the default for future boxes.
-- Per-box opacity/color settings.
+- Move icons between comment boxes.
+- Create a box from selected desktop icons using the Nemo action/shortcut.
+- Per-box appearance settings.
+- New boxes default to per-workspace behavior.
+- Right-click the title/header bar to open the menu.
 - Autostart on login.
-- Nemo action: **Create Comment Box from Selection**.
-- Optional `C` shortcut through Nemo Actions.
 
-## Requirements
-
-Tested for Linux Mint Cinnamon with Nemo desktop icons.
-
-Install dependencies:
+## Install
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-gi gir1.2-gtk-3.0 gir1.2-gdkpixbuf-2.0 gir1.2-pango-1.0 libglib2.0-bin xdg-utils
-```
+sudo apt install -y python3-gi gir1.2-gtk-3.0
 
-Optional notifications:
-
-```bash
-sudo apt install -y libnotify-bin
-```
-
-## Install from GitHub
-
-```bash
 git clone https://github.com/YOUR_USERNAME/desktop-comment-box-gtk.git
 cd desktop-comment-box-gtk
 chmod +x install.sh
 ./install.sh
+desktop-comment-box &
 ```
 
-Run it:
+Optional workspace restore helpers:
+
+```bash
+sudo apt install -y xdotool wmctrl
+```
+
+## Commands
+
+Start:
 
 ```bash
 desktop-comment-box &
 ```
 
-Create another box:
+Create a new box:
 
 ```bash
 desktop-comment-box --new &
 ```
 
-Stop the app:
+Kill/stop:
 
 ```bash
 pkill -f desktop_comment_box.py
 ```
 
-Uninstall:
-
-```bash
-./uninstall.sh
-```
-
-## Usage
-
-### Box controls
-
-- Move box: drag the title bar.
-- Rename box: double-click the title.
-- Resize box: drag a window edge/corner.
-- Select box: click the title bar.
-- Delete selected box: press Delete and confirm.
-- Configure appearance: menu button → Configure Appearance.
-- Set defaults: menu button → Configure Appearance → check **Use this appearance as defaults for new boxes**.
-
-### Icon controls
-
-- Add icons: drag files/folders/launchers from Desktop or Nemo into a box.
-- Move inside a box: drag an icon and release it on the grid.
-- Move to another box: drag the icon into another box.
-- Export to Desktop: drag the icon outside all boxes and release it.
-
-### Create a box from selected Desktop icons
-
-The installer adds this Nemo action:
-
-```text
-Create Comment Box from Selection
-```
-
-Use it like this:
-
-1. Select one or more files directly on `~/Desktop`.
-2. Right-click one of the selected items.
-3. Choose **Create Comment Box from Selection**.
-
-The capture action is intentionally strict:
-
-- Nothing selected: does nothing.
-- `~/Desktop` itself: rejected.
-- Files outside `~/Desktop`: rejected.
-- Nested files inside Desktop folders: rejected.
-- Mixed Desktop + non-Desktop selections: rejected.
-
-### Optional `C` shortcut
-
-Linux Mint's Nemo Actions app can assign a shortcut to the action.
-
-1. Open the Mint menu.
-2. Search for **Actions**.
-3. Open **Actions**.
-4. Go to **Layout**.
-5. Select **Create Comment Box from Selection**.
-6. Click **Click to add a shortcut**.
-7. Press `C`.
-8. Save.
-
-Use this only as a Nemo/Desktop action shortcut, not as a global system shortcut.
-
-## Data locations
-
-Installed app:
-
-```text
-~/.local/share/desktop-comment-box-gtk/
-```
-
-Command wrappers:
-
-```text
-~/.local/bin/desktop-comment-box
-~/.local/bin/desktop-comment-box-capture
-```
-
-Saved configuration:
-
-```text
-~/.config/desktop-comment-box-gtk/config.json
-```
-
-Box storage folders:
-
-```text
-~/.local/share/desktop-comment-box-gtk/boxes/
-```
-
-Capture log:
-
-```text
-~/.cache/desktop-comment-box-gtk/capture.log
-```
-
-## Troubleshooting
-
-Kill all running instances:
-
-```bash
-pkill -f desktop_comment_box.py
-```
-
-Repair saved duplicate/synced box state:
+Repair old duplicate state:
 
 ```bash
 desktop-comment-box --repair
 ```
 
-Recover the newest hidden box folder to Desktop:
+## Capture selected desktop icons
 
-```bash
-desktop-comment-box --recover-latest
+The installer adds a Nemo action:
+
+```text
+Create Comment Box from Selection
 ```
 
-Open hidden box storage:
+Use it from the desktop context menu or assign it a shortcut in Nemo Actions. Capture only works with selected items directly inside `~/Desktop`; empty selections and mixed locations are rejected.
 
-```bash
-nemo ~/.local/share/desktop-comment-box-gtk/boxes &
+## Default appearance for Git builds
+
+The app supports bundled defaults in:
+
+```text
+desktop-comment-box/defaults.json
 ```
 
-Read capture errors:
+To bake your current local defaults into the repo after configuring them in the app:
 
 ```bash
-cat ~/.cache/desktop-comment-box-gtk/capture.log
+./scripts/bake-defaults-from-current.sh
+git add desktop-comment-box/defaults.json
+git commit -m "Set default appearance"
 ```
 
-## Build a release ZIP
+## Uninstall
 
 ```bash
-./scripts/package.sh
+./uninstall.sh
 ```
 
-The ZIP will be written to `dist/`.
 
-## License
+## v1.4.10 note
 
-MIT. See `LICENSE`.
+The hidden maximum box size is **1800×1300 px**.

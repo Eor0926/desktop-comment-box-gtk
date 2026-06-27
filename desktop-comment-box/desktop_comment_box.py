@@ -20,8 +20,14 @@ from urllib.parse import urlparse, unquote
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, Gio, GLib, Pango, GdkPixbuf
+try:
+    gi.require_version('GdkX11', '3.0')
+    from gi.repository import GdkX11
+except Exception:
+    GdkX11 = None
 
 APP_ID = 'desktop-comment-box-gtk'
+APP_VERSION = '1.4.9'
 CONFIG_DIR = Path.home() / '.config' / APP_ID
 DATA_DIR = Path.home() / '.local' / 'share' / APP_ID
 BOX_DIR = DATA_DIR / 'boxes'
@@ -31,6 +37,8 @@ CONTROL_SOCKET = CONFIG_DIR / 'control.sock'
 DESKTOP_DIR = Path.home() / 'Desktop'
 LOG_DIR = Path.home() / '.cache' / APP_ID
 CAPTURE_LOG = LOG_DIR / 'capture.log'
+BUNDLED_DEFAULTS_FILE = Path(__file__).with_name('defaults.json')
+_BUNDLED_DEFAULTS_CACHE = None
 URI_TARGETS = [Gtk.TargetEntry.new('text/uri-list', 0, 0)]
 
 DEFAULTS = {
@@ -49,30 +57,69 @@ DEFAULTS = {
 
 MIN_BOX_WIDTH = 180
 MIN_BOX_HEIGHT = 140
-MAX_BOX_WIDTH = 900
-MAX_BOX_HEIGHT = 650
+MAX_BOX_WIDTH = 1800
+MAX_BOX_HEIGHT = 1300
 GRID_MARGIN_X = 8
 GRID_MARGIN_Y = 8
 TITLEBAR_CAPTURE_OFFSET = 46
 CAPTURE_BOX_PADDING = 14
 
 
-STYLE_KEYS = ['background', 'border', 'title_color', 'label_color', 'hover', 'window_opacity', 'icon_size', 'show_hidden']
+STYLE_KEYS = ['background', 'border', 'title_color', 'label_color', 'hover', 'window_opacity', 'icon_size', 'show_hidden', 'per_workspace']
+
+
+def get_factory_defaults():
+    """Return built-in defaults, optionally overridden by bundled defaults.json.
+
+    The bundled defaults file lets the GitHub source bake in one user's preferred
+    appearance without affecting existing installed user config. The file may be
+    either a flat defaults dict or a full app config containing a `defaults` dict.
+    """
+    global _BUNDLED_DEFAULTS_CACHE
+    if _BUNDLED_DEFAULTS_CACHE is not None:
+        return dict(_BUNDLED_DEFAULTS_CACHE)
+
+    data = dict(DEFAULTS)
+    data.update({
+        'title': 'New Box',
+        'show_hidden': False,
+        'per_workspace': True,
+        'workspace': None,
+    })
+
+    try:
+        if BUNDLED_DEFAULTS_FILE.exists():
+            raw = json.loads(BUNDLED_DEFAULTS_FILE.read_text())
+            if isinstance(raw, dict):
+                if isinstance(raw.get('defaults'), dict):
+                    raw = raw.get('defaults')
+                for key in STYLE_KEYS + ['title', 'width', 'height']:
+                    if key in raw:
+                        data[key] = raw[key]
+    except Exception:
+        pass
+
+    data['per_workspace'] = bool(data.get('per_workspace', True))
+    _BUNDLED_DEFAULTS_CACHE = dict(data)
+    return dict(data)
 
 
 def new_default_settings():
+    d = get_factory_defaults()
     return {
-        'title': 'New Box',
-        'width': DEFAULTS['width'],
-        'height': DEFAULTS['height'],
-        'background': DEFAULTS['background'],
-        'border': DEFAULTS['border'],
-        'title_color': DEFAULTS['title_color'],
-        'label_color': DEFAULTS['label_color'],
-        'hover': DEFAULTS['hover'],
-        'window_opacity': DEFAULTS['window_opacity'],
-        'icon_size': DEFAULTS['icon_size'],
-        'show_hidden': False,
+        'title': d.get('title', 'New Box'),
+        'width': d.get('width', DEFAULTS['width']),
+        'height': d.get('height', DEFAULTS['height']),
+        'background': d.get('background', DEFAULTS['background']),
+        'border': d.get('border', DEFAULTS['border']),
+        'title_color': d.get('title_color', DEFAULTS['title_color']),
+        'label_color': d.get('label_color', DEFAULTS['label_color']),
+        'hover': d.get('hover', DEFAULTS['hover']),
+        'window_opacity': d.get('window_opacity', DEFAULTS['window_opacity']),
+        'icon_size': d.get('icon_size', DEFAULTS['icon_size']),
+        'show_hidden': bool(d.get('show_hidden', False)),
+        'per_workspace': bool(d.get('per_workspace', True)),
+        'workspace': d.get('workspace', None),
     }
 
 
@@ -98,6 +145,8 @@ def migrate_box_settings(box):
     box.setdefault('window_opacity', DEFAULTS['window_opacity'])
     box.setdefault('icon_size', DEFAULTS['icon_size'])
     box.setdefault('show_hidden', False)
+    box.setdefault('per_workspace', bool(get_factory_defaults().get('per_workspace', True)))
+    box.setdefault('workspace', None)
     box['width'], box['height'] = clamp_size(box.get('width', DEFAULTS['width']), box.get('height', DEFAULTS['height']))
     return box
 
@@ -114,6 +163,13 @@ def repair_config(cfg):
     if not isinstance(cfg, dict):
         cfg = {'defaults': new_default_settings(), 'boxes': []}
     cfg.setdefault('defaults', new_default_settings())
+    if not isinstance(cfg.get('defaults'), dict):
+        cfg['defaults'] = new_default_settings()
+    # v1.4.8 migration: make per-workspace the default for newly-created boxes once.
+    # Existing boxes are not changed. Users can later disable it in appearance defaults.
+    if not cfg.get('_migrated_per_workspace_default_v148', False):
+        cfg['defaults']['per_workspace'] = True
+        cfg['_migrated_per_workspace_default_v148'] = True
     if not isinstance(cfg.get('boxes'), list):
         cfg['boxes'] = []
 
@@ -193,6 +249,8 @@ def make_box_from_defaults(defaults, title=None, offset=0):
         'window_opacity': float(d.get('window_opacity', DEFAULTS['window_opacity'])),
         'icon_size': int(d.get('icon_size', DEFAULTS['icon_size'])),
         'show_hidden': bool(d.get('show_hidden', False)),
+        'per_workspace': bool(d.get('per_workspace', False)),
+        'workspace': d.get('workspace', None),
         'positions': {},
     })
 
@@ -528,6 +586,74 @@ def gdk_origin_xy(gdk_window):
         return int(origin.root_x), int(origin.root_y)
     except Exception:
         return 0, 0
+
+
+
+def get_current_workspace():
+    """Return the current workspace number, if the window manager exposes it.
+
+    Linux Mint/Cinnamon normally supports EWMH workspace controls on X11.  This
+    app does not require wmctrl/xdotool, but will use either if installed so a
+    per-workspace box can be restored to the same workspace after restart.
+    """
+    try:
+        out = subprocess.check_output(['xdotool', 'get_desktop'], text=True, stderr=subprocess.DEVNULL, timeout=0.5)
+        return int(out.strip())
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(['wmctrl', '-d'], text=True, stderr=subprocess.DEVNULL, timeout=0.5)
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == '*':
+                return int(parts[0])
+    except Exception:
+        pass
+    return None
+
+
+def window_xid(gtk_window):
+    """Return the X11 window id for workspace movement helpers, if available."""
+    try:
+        gdk_win = gtk_window.get_window()
+        if not gdk_win:
+            return None
+        if hasattr(gdk_win, 'get_xid'):
+            return int(gdk_win.get_xid())
+        if GdkX11 is not None and hasattr(GdkX11, 'X11Window'):
+            return int(GdkX11.X11Window.get_xid(gdk_win))
+    except Exception:
+        pass
+    return None
+
+
+def move_window_to_workspace(gtk_window, workspace):
+    """Move a GTK window to a numbered workspace when helper tools exist.
+
+    If neither xdotool nor wmctrl is installed, unstick() still makes the window
+    per-workspace for the current session; it just may not restore to a saved
+    workspace after login.
+    """
+    try:
+        if workspace is None:
+            return False
+        workspace = int(workspace)
+    except Exception:
+        return False
+    xid = window_xid(gtk_window)
+    if not xid:
+        return False
+    try:
+        subprocess.run(['xdotool', 'set_desktop_for_window', str(xid), str(workspace)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+        return True
+    except Exception:
+        pass
+    try:
+        subprocess.run(['wmctrl', '-ir', hex(xid), '-t', str(workspace)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.5)
+        return True
+    except Exception:
+        pass
+    return False
 
 
 def send_payload_to_running(payload) -> bool:
@@ -1034,7 +1160,7 @@ class DesktopBoxWindow(Gtk.Window):
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
         self.set_keep_below(True)
-        self.stick()
+        self._apply_workspace_behavior(later=False)
         self.set_app_paintable(True)
         self.connect('draw', self._on_draw_transparent)
         w, h = clamp_size(settings.get('width', DEFAULTS['width']), settings.get('height', DEFAULTS['height']))
@@ -1068,6 +1194,51 @@ class DesktopBoxWindow(Gtk.Window):
         self.refresh_icons()
         self.add_drop_target(self)
         self.show_all()
+        self._apply_workspace_behavior(later=True)
+
+    def _apply_workspace_behavior(self, later=True, remember_current=False):
+        """Apply the per-workspace checkbox for this box.
+
+        Unchecked = sticky window visible on every workspace.
+        Checked = normal window visible only on one workspace. When the box is
+        first changed to per-workspace, remember the current workspace so it can
+        be restored on the next login when xdotool/wmctrl is available.
+        """
+        try:
+            per_ws = bool(self.settings.get('per_workspace', False))
+            if not per_ws:
+                try:
+                    self.stick()
+                except Exception:
+                    pass
+                return False
+
+            try:
+                self.unstick()
+            except Exception:
+                pass
+
+            if remember_current or self.settings.get('workspace') is None:
+                ws = get_current_workspace()
+                if ws is not None:
+                    self.settings['workspace'] = int(ws)
+
+            ws = self.settings.get('workspace')
+            if later:
+                GLib.timeout_add(300, self._move_to_saved_workspace)
+            elif ws is not None:
+                move_window_to_workspace(self, ws)
+        except Exception:
+            pass
+        return False
+
+    def _move_to_saved_workspace(self):
+        try:
+            if bool(self.settings.get('per_workspace', False)):
+                move_window_to_workspace(self, self.settings.get('workspace'))
+        except Exception:
+            pass
+        return False
 
     def _setup_transparent_window(self):
         try:
@@ -1134,10 +1305,9 @@ class DesktopBoxWindow(Gtk.Window):
         self.title_label.get_style_context().add_class(self.css_title_class)
         self.title_row.pack_start(self.title_label, True, True, 0)
 
-        self.menu_button = Gtk.Button.new_from_icon_name('open-menu-symbolic', Gtk.IconSize.MENU)
-        self.menu_button.set_relief(Gtk.ReliefStyle.NONE)
-        self.menu_button.connect('clicked', self._show_menu)
-        self.title_row.pack_end(self.menu_button, False, False, 0)
+        # Right-click anywhere on the title bar opens the menu.
+        # No visible menu button is shown because the whole header is already the handle.
+        self.menu_button = None
 
         self.viewport = Gtk.EventBox()
         self.viewport.set_visible_window(False)
@@ -1229,7 +1399,8 @@ class DesktopBoxWindow(Gtk.Window):
         if event:
             menu.popup_at_pointer(event)
         else:
-            menu.popup_at_widget(self.menu_button, Gdk.Gravity.SOUTH_EAST, Gdk.Gravity.NORTH_EAST, None)
+            anchor = self.title_bar if self.title_bar is not None else self
+            menu.popup_at_widget(anchor, Gdk.Gravity.SOUTH_EAST, Gdk.Gravity.NORTH_EAST, None)
 
     def _apply_css(self):
         css = f'''
@@ -1818,6 +1989,13 @@ class DesktopBoxWindow(Gtk.Window):
         fields['show_hidden'] = hidden
 
         row += 1
+        per_workspace = Gtk.CheckButton(label='Per-workspace box')
+        per_workspace.set_active(bool(target_settings.get('per_workspace', False)))
+        per_workspace.set_tooltip_text('When enabled, this box is visible only on the workspace where it is assigned. When disabled, it is visible on all workspaces.')
+        grid.attach(per_workspace, 0, row, 3, 1)
+        fields['per_workspace'] = per_workspace
+
+        row += 1
         save_as_defaults = None
         if apply_current:
             save_as_defaults = Gtk.CheckButton(label='Use this appearance as defaults for new boxes')
@@ -1841,6 +2019,12 @@ class DesktopBoxWindow(Gtk.Window):
             target_settings['window_opacity'] = max(0.05, min(1.0, fields['window_opacity'].get_value() / 100.0))
             target_settings['icon_size'] = int(fields['icon_size'].get_value())
             target_settings['show_hidden'] = fields['show_hidden'].get_active()
+            old_per_workspace = bool(self.settings.get('per_workspace', False)) if apply_current else bool(target_settings.get('per_workspace', False))
+            target_settings['per_workspace'] = fields['per_workspace'].get_active()
+            if apply_current and target_settings['per_workspace'] and (not old_per_workspace or self.settings.get('workspace') is None):
+                ws = get_current_workspace()
+                if ws is not None:
+                    self.settings['workspace'] = int(ws)
             self.app.save()
             if apply_current:
                 try:
@@ -1848,6 +2032,7 @@ class DesktopBoxWindow(Gtk.Window):
                 except Exception:
                     pass
                 self._apply_css()
+                self._apply_workspace_behavior(later=True, remember_current=bool(self.settings.get('per_workspace', False)) and not old_per_workspace)
                 self.refresh_icons()
                 try:
                     if save_as_defaults is not None and save_as_defaults.get_active():
@@ -2166,6 +2351,8 @@ class DesktopCommentBoxApp:
         log_capture(f'capture bounds: min=({min_x},{min_y}) max=({max_x},{max_y}) box=({box_x},{box_y},{width},{height})')
 
         settings = make_box_from_defaults(defaults, title=capture_title, offset=0)
+        if settings.get('per_workspace'):
+            settings['workspace'] = get_current_workspace()
         settings['x'] = int(box_x)
         settings['y'] = int(box_y)
         settings['width'] = int(width)
@@ -2200,6 +2387,8 @@ class DesktopCommentBoxApp:
         self._runtime_repair_config()
         offset = 40 * len(self.config.get('boxes', []))
         settings = make_box_from_defaults(self.config.get('defaults', new_default_settings()), title=None, offset=offset)
+        if settings.get('per_workspace'):
+            settings['workspace'] = get_current_workspace()
         # Guarantee that the new box is unique against any repaired/stale config.
         existing_ids = {str(b.get('id')) for b in self.config.get('boxes', []) if isinstance(b, dict)}
         while settings.get('id') in existing_ids:
