@@ -1,5 +1,7 @@
 # Desktop Comment Box GTK
 
+DISCLAIMER: AI GENERATED
+
 Desktop Comment Box GTK creates draggable, resizable desktop icon containers for Linux Mint/Cinnamon. It is meant to behave like a desktop version of UE-style comment boxes: group files visually, drag files in and out, move icons on a grid, and capture selected desktop icons into a new box.
 
 ## Features
