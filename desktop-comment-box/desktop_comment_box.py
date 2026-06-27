@@ -27,7 +27,7 @@ except Exception:
     GdkX11 = None
 
 APP_ID = 'desktop-comment-box-gtk'
-APP_VERSION = '1.4.9'
+APP_VERSION = '1.4.11'
 CONFIG_DIR = Path.home() / '.config' / APP_ID
 DATA_DIR = Path.home() / '.local' / 'share' / APP_ID
 BOX_DIR = DATA_DIR / 'boxes'
@@ -37,20 +37,18 @@ CONTROL_SOCKET = CONFIG_DIR / 'control.sock'
 DESKTOP_DIR = Path.home() / 'Desktop'
 LOG_DIR = Path.home() / '.cache' / APP_ID
 CAPTURE_LOG = LOG_DIR / 'capture.log'
-BUNDLED_DEFAULTS_FILE = Path(__file__).with_name('defaults.json')
-_BUNDLED_DEFAULTS_CACHE = None
 URI_TARGETS = [Gtk.TargetEntry.new('text/uri-list', 0, 0)]
 
 DEFAULTS = {
-    'background': '#2f343acc',
-    'border': '#80a8ffff',
-    'title_color': '#ffffffff',
-    'label_color': '#ffffffff',
-    'hover': '#ffffff22',
+    'background': 'rgba(116,116,120,0.2)',
+    'border': 'rgba(192,191,188,0.7)',
+    'title_color': 'rgb(255,255,255)',
+    'label_color': 'rgb(255,255,255)',
+    'hover': 'rgb(255,255,255)',
     'window_opacity': 1.0,
     'icon_size': 48,
-    'width': 360,
-    'height': 260,
+    'width': 769,
+    'height': 538,
     'x': 120,
     'y': 120,
 }
@@ -69,16 +67,6 @@ STYLE_KEYS = ['background', 'border', 'title_color', 'label_color', 'hover', 'wi
 
 
 def get_factory_defaults():
-    """Return built-in defaults, optionally overridden by bundled defaults.json.
-
-    The bundled defaults file lets the GitHub source bake in one user's preferred
-    appearance without affecting existing installed user config. The file may be
-    either a flat defaults dict or a full app config containing a `defaults` dict.
-    """
-    global _BUNDLED_DEFAULTS_CACHE
-    if _BUNDLED_DEFAULTS_CACHE is not None:
-        return dict(_BUNDLED_DEFAULTS_CACHE)
-
     data = dict(DEFAULTS)
     data.update({
         'title': 'New Box',
@@ -86,23 +74,7 @@ def get_factory_defaults():
         'per_workspace': True,
         'workspace': None,
     })
-
-    try:
-        if BUNDLED_DEFAULTS_FILE.exists():
-            raw = json.loads(BUNDLED_DEFAULTS_FILE.read_text())
-            if isinstance(raw, dict):
-                if isinstance(raw.get('defaults'), dict):
-                    raw = raw.get('defaults')
-                for key in STYLE_KEYS + ['title', 'width', 'height']:
-                    if key in raw:
-                        data[key] = raw[key]
-    except Exception:
-        pass
-
-    data['per_workspace'] = bool(data.get('per_workspace', True))
-    _BUNDLED_DEFAULTS_CACHE = dict(data)
-    return dict(data)
-
+    return data
 
 def new_default_settings():
     d = get_factory_defaults()
