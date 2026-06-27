@@ -22,7 +22,7 @@ Desktop Comment Box GTK creates draggable, resizable desktop icon containers for
 sudo apt update
 sudo apt install -y python3-gi gir1.2-gtk-3.0
 
-git clone https://github.com/YOUR_USERNAME/desktop-comment-box-gtk.git
+git clone git clone https://github.com/Eor0926/desktop-comment-box-gtk.git
 cd desktop-comment-box-gtk
 chmod +x install.sh
 ./install.sh
