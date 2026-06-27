@@ -1,4 +1,14 @@
+## v1.4.13
+
+- Preserves Nemo/GVFS custom icon metadata when moving files or folders between boxes or back to the Desktop.
+- Fixes exported folders losing their custom icon after being dragged out of a comment box.
+
 # Changelog
+
+## v1.4.12
+- Respect custom folder icons set through Nemo/Gio metadata.
+- Respect `.directory` Icon= custom folder icons where present.
+- Use the same custom icon lookup for normal display icons and drag previews.
 
 ## v1.4.11
 

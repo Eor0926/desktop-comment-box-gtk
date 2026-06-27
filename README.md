@@ -1,7 +1,5 @@
 # Desktop Comment Box GTK
 
-Disclaimer: AI Generated
-
 Desktop Comment Box GTK creates draggable, resizable desktop icon containers for Linux Mint/Cinnamon. It is meant to behave like a desktop version of UE-style comment boxes: group files visually, drag files in and out, move icons on a grid, and capture selected desktop icons into a new box.
 
 ## Features
@@ -22,7 +20,7 @@ Desktop Comment Box GTK creates draggable, resizable desktop icon containers for
 sudo apt update
 sudo apt install -y python3-gi gir1.2-gtk-3.0
 
-git clone git clone https://github.com/Eor0926/desktop-comment-box-gtk.git
+git clone https://github.com/YOUR_USERNAME/desktop-comment-box-gtk.git
 cd desktop-comment-box-gtk
 chmod +x install.sh
 ./install.sh
@@ -78,6 +76,11 @@ Use it from the desktop context menu or assign it a shortcut in Nemo Actions. Ca
 ```
 
 
-## v1.4.11 note
+## v1.4.13 note
 
 The hidden maximum box size is **1800×1300 px**. The standard default appearance is built into the app; no extra defaults file is needed.
+
+
+### v1.4.13 note
+
+Preserves custom folder icons when items are moved back to the Desktop.

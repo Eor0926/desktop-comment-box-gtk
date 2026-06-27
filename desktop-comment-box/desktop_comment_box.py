@@ -27,7 +27,7 @@ except Exception:
     GdkX11 = None
 
 APP_ID = 'desktop-comment-box-gtk'
-APP_VERSION = '1.4.11'
+APP_VERSION = '1.4.13'
 CONFIG_DIR = Path.home() / '.config' / APP_ID
 DATA_DIR = Path.home() / '.local' / 'share' / APP_ID
 BOX_DIR = DATA_DIR / 'boxes'
@@ -401,7 +401,9 @@ def move_path_to(src: Path, dest_dir: Path) -> Path:
             return dest
     except Exception:
         pass
+    icon_metadata = read_custom_icon_metadata(src)
     shutil.move(str(src), str(dest))
+    apply_custom_icon_metadata(dest, icon_metadata)
     return dest
 
 
@@ -664,6 +666,231 @@ def send_capture_to_running(paths) -> bool:
 
 
 
+
+def _icon_name_to_pixbuf(name, size):
+    """Load a themed icon name as a pixbuf, returning None on failure."""
+    if not name:
+        return None
+    try:
+        theme = Gtk.IconTheme.get_default()
+        return theme.load_icon(str(name), int(size), Gtk.IconLookupFlags.FORCE_SIZE)
+    except Exception:
+        return None
+
+
+def _file_or_uri_to_path(value):
+    """Convert a Gio metadata custom-icon value into a local filesystem path."""
+    if not value:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    try:
+        parsed = urlparse(value)
+        if parsed.scheme == 'file':
+            return Path(unquote(parsed.path)).expanduser()
+        if parsed.scheme:
+            return None
+    except Exception:
+        pass
+    return Path(value).expanduser()
+
+
+def _pixbuf_from_image_path(value, size):
+    path = _file_or_uri_to_path(value)
+    if not path or not path.exists():
+        return None
+    try:
+        return GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), int(size), int(size), True)
+    except Exception:
+        return None
+
+
+def _pixbuf_from_gicon(icon, size):
+    if not icon:
+        return None
+    try:
+        theme = Gtk.IconTheme.get_default()
+        info = theme.lookup_by_gicon(icon, int(size), Gtk.IconLookupFlags.FORCE_SIZE)
+        if info:
+            return info.load_icon()
+    except Exception:
+        return None
+    return None
+
+
+def _read_dot_directory_icon(path):
+    """Read KDE/Nemo-compatible .directory Icon= custom folder icons."""
+    try:
+        if not path.is_dir():
+            return None
+        dot = path / '.directory'
+        if not dot.exists():
+            return None
+        for line in dot.read_text(errors='ignore').splitlines():
+            line = line.strip()
+            if line.startswith('Icon='):
+                return line.split('=', 1)[1].strip()
+    except Exception:
+        return None
+    return None
+
+
+def custom_icon_pixbuf_for_path(path, size):
+    """Return a custom folder/file icon pixbuf if Nemo/Gio metadata defines one.
+
+    Nemo custom folder icons are commonly stored as gvfs metadata attributes such
+    as metadata::custom-icon or metadata::custom-icon-name.  standard::icon often
+    still resolves to the generic folder icon, so query the metadata attributes
+    first and only fall back to standard icons when no custom icon exists.
+    """
+    path = Path(path)
+    size = int(size)
+
+    try:
+        gfile = Gio.File.new_for_path(str(path))
+        info = gfile.query_info(
+            'metadata::custom-icon,metadata::custom-icon-name,thumbnail::path,standard::icon',
+            Gio.FileQueryInfoFlags.NONE,
+            None,
+        )
+
+        custom_icon = info.get_attribute_string('metadata::custom-icon')
+        pixbuf = _pixbuf_from_image_path(custom_icon, size)
+        if pixbuf:
+            return pixbuf
+
+        custom_icon_name = info.get_attribute_string('metadata::custom-icon-name')
+        pixbuf = _icon_name_to_pixbuf(custom_icon_name, size)
+        if pixbuf:
+            return pixbuf
+
+        thumb = info.get_attribute_string('thumbnail::path')
+        pixbuf = _pixbuf_from_image_path(thumb, size)
+        if pixbuf:
+            return pixbuf
+    except Exception:
+        pass
+
+    dot_icon = _read_dot_directory_icon(path)
+    pixbuf = _pixbuf_from_image_path(dot_icon, size)
+    if pixbuf:
+        return pixbuf
+    pixbuf = _icon_name_to_pixbuf(dot_icon, size)
+    if pixbuf:
+        return pixbuf
+
+    return None
+
+
+def standard_icon_pixbuf_for_path(path, size):
+    path = Path(path)
+    size = int(size)
+    try:
+        if path.suffix == '.desktop':
+            desktop = Gio.DesktopAppInfo.new_from_filename(str(path))
+            icon = desktop.get_icon() if desktop else None
+            pixbuf = _pixbuf_from_gicon(icon, size)
+            if pixbuf:
+                return pixbuf
+    except Exception:
+        pass
+
+    try:
+        gfile = Gio.File.new_for_path(str(path))
+        info = gfile.query_info('standard::icon', Gio.FileQueryInfoFlags.NONE, None)
+        pixbuf = _pixbuf_from_gicon(info.get_icon(), size)
+        if pixbuf:
+            return pixbuf
+    except Exception:
+        pass
+
+    if path.is_dir():
+        return _icon_name_to_pixbuf('folder', size)
+    return _icon_name_to_pixbuf('text-x-generic', size) or _icon_name_to_pixbuf('unknown', size)
+
+
+
+ICON_METADATA_ATTRS = (
+    'metadata::custom-icon',
+    'metadata::custom-icon-name',
+)
+
+
+def read_custom_icon_metadata(path: Path):
+    """Read custom icon metadata before a move/rename.
+
+    GVFS/Nemo metadata is tied to the file URI.  When a folder is moved out of a
+    comment box back to ~/Desktop, the URI changes, so the custom icon metadata
+    can be left attached to the old hidden path.  Capture it before the move and
+    reapply it to the destination path afterward.
+    """
+    path = Path(path)
+    data = {}
+    try:
+        gfile = Gio.File.new_for_path(str(path))
+        info = gfile.query_info(','.join(ICON_METADATA_ATTRS), Gio.FileQueryInfoFlags.NONE, None)
+        for attr in ICON_METADATA_ATTRS:
+            try:
+                value = info.get_attribute_string(attr)
+            except Exception:
+                value = None
+            if value:
+                data[attr] = value
+    except Exception:
+        pass
+
+    # Fallback to `gio info`; some gvfs metadata queries are inconsistent when
+    # launched from menu actions or helper processes.
+    if not data:
+        try:
+            out = subprocess.check_output(['gio', 'info', '-a', 'metadata::*', str(path)], text=True, stderr=subprocess.DEVNULL, timeout=1.0)
+            for line in out.splitlines():
+                line = line.strip()
+                for attr in ICON_METADATA_ATTRS:
+                    prefix = f'{attr}:'
+                    if line.startswith(prefix):
+                        value = line.split(':', 1)[1].strip()
+                        if value and value.lower() != 'unset':
+                            data[attr] = value
+        except Exception:
+            pass
+    return data
+
+
+def apply_custom_icon_metadata(path: Path, data):
+    """Apply custom icon metadata to a file/folder after moving it."""
+    if not data:
+        return
+    path = Path(path)
+
+    try:
+        gfile = Gio.File.new_for_path(str(path))
+        info = Gio.FileInfo()
+        for attr, value in data.items():
+            if attr in ICON_METADATA_ATTRS and value:
+                try:
+                    info.set_attribute_string(attr, str(value))
+                except Exception:
+                    pass
+        try:
+            gfile.set_attributes_from_info(info, Gio.FileQueryInfoFlags.NONE, None)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    for attr, value in data.items():
+        if attr not in ICON_METADATA_ATTRS or not value:
+            continue
+        try:
+            subprocess.run(['gio', 'set', '-t', 'string', str(path), attr, str(value)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.8)
+        except Exception:
+            pass
+
+def display_icon_pixbuf_for_path(path, size):
+    return custom_icon_pixbuf_for_path(path, size) or standard_icon_pixbuf_for_path(path, size)
+
 class IconTile(Gtk.EventBox):
     def __init__(self, window, path: Path, pos_x: int, pos_y: int):
         super().__init__()
@@ -751,24 +978,13 @@ class IconTile(Gtk.EventBox):
 
 
     def _set_icon(self):
-        try:
-            if self.path.suffix == '.desktop':
-                desktop = Gio.DesktopAppInfo.new_from_filename(str(self.path))
-                if desktop and desktop.get_icon():
-                    self.image.set_from_gicon(desktop.get_icon(), Gtk.IconSize.DIALOG)
-                    self.image.set_pixel_size(self.box_window.settings.get('icon_size', 48))
-                    return
-            gfile = Gio.File.new_for_path(str(self.path))
-            info = gfile.query_info('standard::icon', Gio.FileQueryInfoFlags.NONE, None)
-            icon = info.get_icon()
-            if icon:
-                self.image.set_from_gicon(icon, Gtk.IconSize.DIALOG)
-                self.image.set_pixel_size(self.box_window.settings.get('icon_size', 48))
-                return
-        except Exception:
-            pass
+        size = int(self.box_window.settings.get('icon_size', 48))
+        pixbuf = display_icon_pixbuf_for_path(self.path, size)
+        if pixbuf:
+            self.image.set_from_pixbuf(pixbuf)
+            return
         self.image.set_from_icon_name('text-x-generic', Gtk.IconSize.DIALOG)
-        self.image.set_pixel_size(self.box_window.settings.get('icon_size', 48))
+        self.image.set_pixel_size(size)
 
     def _on_button_press(self, _widget, event):
         if event.button == 1 and event.type == Gdk.EventType.DOUBLE_BUTTON_PRESS:
@@ -1026,14 +1242,6 @@ class IconTile(Gtk.EventBox):
 
 
     def _load_drag_pixbuf(self, size: int = 48):
-        theme = Gtk.IconTheme.get_default()
-
-        def load_icon_name(name):
-            try:
-                return theme.load_icon(name, size, Gtk.IconLookupFlags.FORCE_SIZE)
-            except Exception:
-                return None
-
         try:
             if self.path.is_file():
                 content = Gio.content_type_guess(str(self.path), None)[0]
@@ -1041,32 +1249,7 @@ class IconTile(Gtk.EventBox):
                     return GdkPixbuf.Pixbuf.new_from_file_at_scale(str(self.path), size, size, True)
         except Exception:
             pass
-
-        try:
-            if self.path.suffix == '.desktop':
-                desktop = Gio.DesktopAppInfo.new_from_filename(str(self.path))
-                icon = desktop.get_icon() if desktop else None
-                if icon:
-                    info = theme.lookup_by_gicon(icon, size, Gtk.IconLookupFlags.FORCE_SIZE)
-                    if info:
-                        return info.load_icon()
-        except Exception:
-            pass
-
-        try:
-            gfile = Gio.File.new_for_path(str(self.path))
-            info = gfile.query_info('standard::icon', Gio.FileQueryInfoFlags.NONE, None)
-            icon = info.get_icon()
-            if icon:
-                icon_info = theme.lookup_by_gicon(icon, size, Gtk.IconLookupFlags.FORCE_SIZE)
-                if icon_info:
-                    return icon_info.load_icon()
-        except Exception:
-            pass
-
-        if self.path.is_dir():
-            return load_icon_name('folder')
-        return load_icon_name('text-x-generic') or load_icon_name('unknown')
+        return display_icon_pixbuf_for_path(self.path, size)
 
     def _on_drag_begin(self, _widget, context):
         size = int(self.box_window.settings.get('icon_size', 48))
