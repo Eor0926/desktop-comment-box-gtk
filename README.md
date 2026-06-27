@@ -1,5 +1,8 @@
 # Desktop Comment Box GTK
 
+DISCLAIMER: THIS IS ENTIRELY AI GENERATED
+
+
 Desktop Comment Box GTK is a Linux Mint Cinnamon utility for grouping desktop icons inside movable, resizable, Blueprint-style comment boxes.
 
 It is a small GTK 3 desktop app, not a Cinnamon desklet. That matters because GTK can receive real file-manager drag/drop events from Nemo, while Cinnamon desklets cannot reliably receive external desktop/file-manager drops.
