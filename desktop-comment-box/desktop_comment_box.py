@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import json
+import hashlib
+import mimetypes
 import os
 import shutil
 import subprocess
@@ -10,6 +12,7 @@ import socket
 import threading
 import atexit
 import time
+import tempfile
 try:
     import cairo
 except Exception:
@@ -27,7 +30,7 @@ except Exception:
     GdkX11 = None
 
 APP_ID = 'desktop-comment-box-gtk'
-APP_VERSION = '1.4.13'
+APP_VERSION = '1.4.19'
 CONFIG_DIR = Path.home() / '.config' / APP_ID
 DATA_DIR = Path.home() / '.local' / 'share' / APP_ID
 BOX_DIR = DATA_DIR / 'boxes'
@@ -38,32 +41,36 @@ DESKTOP_DIR = Path.home() / 'Desktop'
 LOG_DIR = Path.home() / '.cache' / APP_ID
 CAPTURE_LOG = LOG_DIR / 'capture.log'
 URI_TARGETS = [Gtk.TargetEntry.new('text/uri-list', 0, 0)]
+PIXBUF_CACHE = {}
+VIDEO_THUMB_CACHE = LOG_DIR / 'video-thumbnails'
 
 DEFAULTS = {
     'background': 'rgba(116,116,120,0.2)',
     'border': 'rgba(192,191,188,0.7)',
     'title_color': 'rgb(255,255,255)',
     'label_color': 'rgb(255,255,255)',
-    'hover': 'rgb(255,255,255)',
+    'hover': 'rgb(119,118,123)',
+    'selection': 'rgba(61,132,225,0.55)',
     'window_opacity': 1.0,
     'icon_size': 48,
-    'width': 769,
-    'height': 538,
+    'width': 180,
+    'height': 721,
     'x': 120,
     'y': 120,
 }
 
-MIN_BOX_WIDTH = 180
-MIN_BOX_HEIGHT = 140
+MIN_BOX_WIDTH = 152
+MIN_BOX_HEIGHT = 172
 MAX_BOX_WIDTH = 1800
 MAX_BOX_HEIGHT = 1300
 GRID_MARGIN_X = 8
 GRID_MARGIN_Y = 8
 TITLEBAR_CAPTURE_OFFSET = 46
 CAPTURE_BOX_PADDING = 14
+RESIZE_GRID_SETTLE_MS = 350
 
 
-STYLE_KEYS = ['background', 'border', 'title_color', 'label_color', 'hover', 'window_opacity', 'icon_size', 'show_hidden', 'per_workspace']
+STYLE_KEYS = ['background', 'border', 'title_color', 'label_color', 'hover', 'selection', 'window_opacity', 'icon_size', 'show_hidden', 'per_workspace']
 
 
 def get_factory_defaults():
@@ -71,7 +78,7 @@ def get_factory_defaults():
     data.update({
         'title': 'New Box',
         'show_hidden': False,
-        'per_workspace': True,
+        'per_workspace': False,
         'workspace': None,
     })
     return data
@@ -87,10 +94,11 @@ def new_default_settings():
         'title_color': d.get('title_color', DEFAULTS['title_color']),
         'label_color': d.get('label_color', DEFAULTS['label_color']),
         'hover': d.get('hover', DEFAULTS['hover']),
+        'selection': d.get('selection', DEFAULTS['selection']),
         'window_opacity': d.get('window_opacity', DEFAULTS['window_opacity']),
         'icon_size': d.get('icon_size', DEFAULTS['icon_size']),
         'show_hidden': bool(d.get('show_hidden', False)),
-        'per_workspace': bool(d.get('per_workspace', True)),
+        'per_workspace': bool(d.get('per_workspace', DEFAULTS.get('per_workspace', False))),
         'workspace': d.get('workspace', None),
     }
 
@@ -114,6 +122,7 @@ def migrate_box_settings(box):
     box.setdefault('title_color', DEFAULTS['title_color'])
     box.setdefault('label_color', DEFAULTS['label_color'])
     box.setdefault('hover', DEFAULTS['hover'])
+    box.setdefault('selection', DEFAULTS['selection'])
     box.setdefault('window_opacity', DEFAULTS['window_opacity'])
     box.setdefault('icon_size', DEFAULTS['icon_size'])
     box.setdefault('show_hidden', False)
@@ -140,7 +149,7 @@ def repair_config(cfg):
     # v1.4.8 migration: make per-workspace the default for newly-created boxes once.
     # Existing boxes are not changed. Users can later disable it in appearance defaults.
     if not cfg.get('_migrated_per_workspace_default_v148', False):
-        cfg['defaults']['per_workspace'] = True
+        cfg['defaults'].setdefault('per_workspace', bool(get_factory_defaults().get('per_workspace', False)))
         cfg['_migrated_per_workspace_default_v148'] = True
     if not isinstance(cfg.get('boxes'), list):
         cfg['boxes'] = []
@@ -218,6 +227,7 @@ def make_box_from_defaults(defaults, title=None, offset=0):
         'title_color': d.get('title_color', DEFAULTS['title_color']),
         'label_color': d.get('label_color', DEFAULTS['label_color']),
         'hover': d.get('hover', DEFAULTS['hover']),
+        'selection': d.get('selection', DEFAULTS['selection']),
         'window_opacity': float(d.get('window_opacity', DEFAULTS['window_opacity'])),
         'icon_size': int(d.get('icon_size', DEFAULTS['icon_size'])),
         'show_hidden': bool(d.get('show_hidden', False)),
@@ -393,6 +403,19 @@ def open_path(path: Path):
         pass
 
 
+
+def set_file_clipboard(paths, cut=False):
+    """Set a Nemo/Nautilus-compatible file clipboard selection."""
+    try:
+        uris = [Path(p).as_uri() for p in paths]
+        action = 'cut' if cut else 'copy'
+        text = 'x-special/nautilus-clipboard\n' + action + '\n' + '\n'.join(uris) + '\n'
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(text, -1)
+        clipboard.store()
+    except Exception:
+        pass
+
 def move_path_to(src: Path, dest_dir: Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = unique_dest(dest_dir, src.name)
@@ -511,9 +534,38 @@ def set_nemo_icon_position(path: Path, root_x, root_y, icon_size=48):
         except Exception:
             pass
 
-def tile_step_for_settings(settings):
+def tile_geometry_for_settings(settings):
+    """Return fixed desktop-style icon tile geometry.
+
+    Filenames must not change grid spacing or icon placement.  The tile is a
+    fixed rectangle, the icon is scaled into a square area, and the label is
+    clipped to a fixed two-line area below it.
+    """
     icon = int(settings.get('icon_size', DEFAULTS['icon_size']))
-    return max(88, icon + 42), max(88, icon + 48)
+    icon = max(24, min(128, icon))
+    tile_w = max(96, icon + 56)
+    tile_h = max(108, icon + 72)
+    step_x = tile_w + 8
+    step_y = tile_h + 8
+    return tile_w, tile_h, step_x, step_y, icon
+
+
+def tile_visible_geometry_for_settings(settings):
+    """Return the visible icon+label bounds used for resize snapping/export tests.
+
+    The grid cell itself has some spare vertical room so names do not distort
+    placement, but resize snapping should hug the actual icon/label content, not
+    the invisible remainder of the grid cell.
+    """
+    tile_w, _tile_h, step_x, step_y, icon = tile_geometry_for_settings(settings)
+    visible_h = int(icon + 3 + 34 + 8)
+    visible_w = int(tile_w)
+    return visible_w, visible_h, step_x, step_y, icon
+
+
+def tile_step_for_settings(settings):
+    _tile_w, _tile_h, step_x, step_y, _icon = tile_geometry_for_settings(settings)
+    return step_x, step_y
 
 
 def canvas_size_for_settings(settings):
@@ -522,9 +574,7 @@ def canvas_size_for_settings(settings):
 
 
 def clamp_position_for_settings(settings, x, y):
-    icon = int(settings.get('icon_size', DEFAULTS['icon_size']))
-    tile_w = max(80, icon + 38)
-    tile_h = max(82, icon + 54)
+    tile_w, tile_h, _step_x, _step_y, _icon = tile_geometry_for_settings(settings)
     canvas_w, canvas_h = canvas_size_for_settings(settings)
     max_x = max(GRID_MARGIN_X, canvas_w - tile_w - GRID_MARGIN_X)
     max_y = max(GRID_MARGIN_Y, canvas_h - tile_h - GRID_MARGIN_Y)
@@ -541,9 +591,7 @@ def xy_to_grid_cell(settings, x, y):
     gx = round((int(x) - GRID_MARGIN_X) / step_x)
     gy = round((int(y) - GRID_MARGIN_Y) / step_y)
     canvas_w, canvas_h = canvas_size_for_settings(settings)
-    icon = int(settings.get('icon_size', DEFAULTS['icon_size']))
-    tile_w = max(80, icon + 38)
-    tile_h = max(82, icon + 54)
+    tile_w, tile_h, _step_x, _step_y, _icon = tile_geometry_for_settings(settings)
     max_gx = max(0, (canvas_w - tile_w - GRID_MARGIN_X) // step_x)
     max_gy = max(0, (canvas_h - tile_h - GRID_MARGIN_Y) // step_y)
     return max(0, min(int(gx), int(max_gx))), max(0, min(int(gy), int(max_gy)))
@@ -736,6 +784,110 @@ def _read_dot_directory_icon(path):
     return None
 
 
+
+def _content_type_for_path(path: Path):
+    try:
+        content, _uncertain = Gio.content_type_guess(str(path), None)
+        if content:
+            return content
+    except Exception:
+        pass
+    try:
+        guessed = mimetypes.guess_type(str(path))[0]
+        return guessed or ''
+    except Exception:
+        return ''
+
+
+def _cached_pixbuf(key, loader):
+    try:
+        cached = PIXBUF_CACHE.get(key)
+        if cached is not None:
+            return cached
+        pixbuf = loader()
+        if pixbuf is not None:
+            PIXBUF_CACHE[key] = pixbuf
+        # Keep cache bounded so long sessions do not grow forever.
+        if len(PIXBUF_CACHE) > 256:
+            for old_key in list(PIXBUF_CACHE.keys())[:64]:
+                PIXBUF_CACHE.pop(old_key, None)
+        return pixbuf
+    except Exception:
+        return None
+
+
+def _pixbuf_from_thumbnail_cache(path: Path, size: int):
+    """Load a freedesktop thumbnail if Nemo/thumbnailers already made one."""
+    try:
+        uri = path.as_uri()
+        digest = hashlib.md5(uri.encode('utf-8')).hexdigest()
+        for subdir in ('xx-large', 'x-large', 'large', 'normal'):
+            thumb = Path.home() / '.cache' / 'thumbnails' / subdir / f'{digest}.png'
+            if thumb.exists():
+                return GdkPixbuf.Pixbuf.new_from_file_at_scale(str(thumb), int(size), int(size), True)
+    except Exception:
+        pass
+    return None
+
+
+def _generate_video_thumbnail(path: Path, size: int):
+    """Generate a small video thumbnail if ffmpegthumbnailer is installed."""
+    try:
+        exe = shutil.which('ffmpegthumbnailer')
+        if not exe:
+            return None
+        VIDEO_THUMB_CACHE.mkdir(parents=True, exist_ok=True)
+        stat = path.stat()
+        digest = hashlib.md5(f'{path.as_uri()}:{stat.st_mtime_ns}:{stat.st_size}:{size}'.encode('utf-8')).hexdigest()
+        out = VIDEO_THUMB_CACHE / f'{digest}.png'
+        if not out.exists():
+            subprocess.run(
+                [exe, '-i', str(path), '-o', str(out), '-s', str(max(96, int(size) * 2)), '-t', '10%'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2.5,
+            )
+        if out.exists():
+            return GdkPixbuf.Pixbuf.new_from_file_at_scale(str(out), int(size), int(size), True)
+    except Exception:
+        pass
+    return None
+
+
+def media_thumbnail_pixbuf_for_path(path, size):
+    """Return image/video thumbnails for regular media files.
+
+    Images are read directly. Videos use existing Nemo/freedesktop thumbnails and
+    optionally ffmpegthumbnailer if it is installed.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None
+    size = int(size)
+    try:
+        stat = path.stat()
+        key = ('media-thumb', str(path), stat.st_mtime_ns, stat.st_size, size)
+    except Exception:
+        key = ('media-thumb', str(path), size)
+
+    def load():
+        content = _content_type_for_path(path)
+        if content.startswith('image/'):
+            try:
+                return GdkPixbuf.Pixbuf.new_from_file_at_scale(str(path), size, size, True)
+            except Exception:
+                pass
+        pixbuf = _pixbuf_from_thumbnail_cache(path, size)
+        if pixbuf:
+            return pixbuf
+        if content.startswith('video/'):
+            pixbuf = _generate_video_thumbnail(path, size)
+            if pixbuf:
+                return pixbuf
+        return None
+
+    return _cached_pixbuf(key, load)
+
 def custom_icon_pixbuf_for_path(path, size):
     """Return a custom folder/file icon pixbuf if Nemo/Gio metadata defines one.
 
@@ -889,7 +1041,7 @@ def apply_custom_icon_metadata(path: Path, data):
             pass
 
 def display_icon_pixbuf_for_path(path, size):
-    return custom_icon_pixbuf_for_path(path, size) or standard_icon_pixbuf_for_path(path, size)
+    return custom_icon_pixbuf_for_path(path, size) or media_thumbnail_pixbuf_for_path(path, size) or standard_icon_pixbuf_for_path(path, size)
 
 class IconTile(Gtk.EventBox):
     def __init__(self, window, path: Path, pos_x: int, pos_y: int):
@@ -922,24 +1074,34 @@ class IconTile(Gtk.EventBox):
         self._last_root = None
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        self.visual_box = outer
         outer.set_halign(Gtk.Align.CENTER)
         outer.set_valign(Gtk.Align.START)
         outer.set_margin_top(4)
         outer.set_margin_bottom(4)
         outer.set_margin_start(4)
         outer.set_margin_end(4)
+        # The outer tile remains full grid-sized for uniform placement, but
+        # the visible hover/selection highlight should hug the icon + label
+        # content. Keep the visual_box as a compact content wrapper instead
+        # of stretching it to the whole grid cell.
+        outer.get_style_context().add_class('dccb-tile-visual')
         self.add(outer)
 
+        tile_w, tile_h, _step_x, _step_y, icon = tile_geometry_for_settings(window.settings)
         self.image = Gtk.Image()
-        self.image.set_pixel_size(window.settings.get('icon_size', 48))
+        self.image.set_pixel_size(icon)
+        self.image.set_size_request(icon, icon)
         self._set_icon()
         outer.pack_start(self.image, False, False, 0)
 
         self.label = Gtk.Label(label=path.name)
         self.label.set_ellipsize(Pango.EllipsizeMode.END)
         self.label.set_justify(Gtk.Justification.CENTER)
-        self.label.set_max_width_chars(14)
+        self.label.set_size_request(max(72, tile_w - 10), 34)
+        self.label.set_max_width_chars(1)
         self.label.set_line_wrap(True)
+        self.label.set_line_wrap_mode(Pango.WrapMode.CHAR)
         self.label.set_lines(2)
         self.label.get_style_context().add_class('dccb-icon-label')
         try:
@@ -950,8 +1112,9 @@ class IconTile(Gtk.EventBox):
 
         # Keep each icon tile at a predictable size so moving it cannot change the
         # containing window's requested dimensions.
-        icon = int(window.settings.get('icon_size', 48))
-        self.set_size_request(max(80, icon + 42), max(84, icon + 62))
+        self.set_size_request(tile_w, tile_h)
+        content_h = icon + 3 + 34 + 8
+        outer.set_size_request(tile_w, content_h)
 
         self.connect('button-press-event', self._on_button_press)
         self.connect('button-release-event', self._on_button_release)
@@ -960,25 +1123,66 @@ class IconTile(Gtk.EventBox):
         self.connect('enter-notify-event', self._on_enter_tile)
         self.connect('leave-notify-event', self._on_leave_tile)
 
+    def set_selected(self, selected: bool):
+        try:
+            contexts = []
+            if getattr(self, 'visual_box', None) is not None:
+                contexts.append(self.visual_box.get_style_context())
+            else:
+                contexts.append(self.get_style_context())
+            for ctx in contexts:
+                if selected:
+                    ctx.add_class('dccb-tile-selected')
+                    ctx.add_class(self.box_window.css_selected_class)
+                else:
+                    ctx.remove_class('dccb-tile-selected')
+                    ctx.remove_class(self.box_window.css_selected_class)
+                    # When a selected tile is unselected while the pointer is no
+                    # longer over it, GTK can leave the hover class behind. Reset
+                    # all transient highlight classes on the compact visual wrapper.
+                    ctx.remove_class('dccb-tile-hover')
+                    ctx.remove_class(self.box_window.css_hover_class)
+            # The full event tile should stay transparent; it is only used for
+            # hit-testing and grid spacing.
+            tctx = self.get_style_context()
+            tctx.remove_class('dccb-tile-selected')
+            tctx.remove_class(self.box_window.css_selected_class)
+            tctx.remove_class('dccb-tile-hover')
+            tctx.remove_class(self.box_window.css_hover_class)
+        except Exception:
+            pass
+
     def _on_enter_tile(self, *_args):
         try:
-            self.get_style_context().add_class('dccb-tile-hover')
-            self.get_style_context().add_class(self.box_window.css_hover_class)
+            ctx = self.visual_box.get_style_context() if getattr(self, 'visual_box', None) is not None else self.get_style_context()
+            ctx.add_class('dccb-tile-hover')
+            ctx.add_class(self.box_window.css_hover_class)
         except Exception:
             pass
         return False
 
     def _on_leave_tile(self, *_args):
+        # Keep the highlight if this tile is selected.
         try:
-            self.get_style_context().remove_class('dccb-tile-hover')
-            self.get_style_context().remove_class(self.box_window.css_hover_class)
+            if self.box_window.is_tile_selected(self):
+                return False
+        except Exception:
+            pass
+        try:
+            contexts = []
+            if getattr(self, 'visual_box', None) is not None:
+                contexts.append(self.visual_box.get_style_context())
+            contexts.append(self.get_style_context())
+            for ctx in contexts:
+                ctx.remove_class('dccb-tile-hover')
+                ctx.remove_class(self.box_window.css_hover_class)
         except Exception:
             pass
         return False
 
 
     def _set_icon(self):
-        size = int(self.box_window.settings.get('icon_size', 48))
+        _tile_w, _tile_h, _step_x, _step_y, size = tile_geometry_for_settings(self.box_window.settings)
         pixbuf = display_icon_pixbuf_for_path(self.path, size)
         if pixbuf:
             self.image.set_from_pixbuf(pixbuf)
@@ -988,10 +1192,12 @@ class IconTile(Gtk.EventBox):
 
     def _on_button_press(self, _widget, event):
         if event.button == 1 and event.type == Gdk.EventType.DOUBLE_BUTTON_PRESS:
+            self.box_window.select_tile(self, event)
             self._cancel_manual_drag()
             open_path(self.path)
             return True
         if event.button == 1:
+            self.box_window.select_tile(self, event)
             self._pressed = True
             self._dragging = False
             self._last_motion_area = None
@@ -1014,18 +1220,9 @@ class IconTile(Gtk.EventBox):
             self._drag_watchdog = GLib.timeout_add(100, self._manual_drag_watchdog)
             return True
         if event.button == 3:
-            menu = Gtk.Menu()
-            open_item = Gtk.MenuItem(label='Open')
-            open_item.connect('activate', lambda *_: open_path(self.path))
-            desktop_item = Gtk.MenuItem(label='Move to Desktop')
-            desktop_item.connect('activate', lambda *_: self.box_window.move_item_to_desktop(self.path))
-            remove_item = Gtk.MenuItem(label='Delete to Trash')
-            remove_item.connect('activate', lambda *_: self.box_window.trash_item(self.path))
-            menu.append(open_item)
-            menu.append(desktop_item)
-            menu.append(remove_item)
-            menu.show_all()
-            menu.popup_at_pointer(event)
+            if not self.box_window.is_tile_selected(self):
+                self.box_window.select_tile(self, event)
+            self.box_window.show_item_menu(self, event)
             return True
         return False
 
@@ -1039,8 +1236,9 @@ class IconTile(Gtk.EventBox):
                 return True
             self._dragging = True
             try:
-                self.get_style_context().add_class('dccb-tile-hover')
-                self.get_style_context().add_class(self.box_window.css_hover_class)
+                ctx = self.visual_box.get_style_context() if getattr(self, 'visual_box', None) is not None else self.get_style_context()
+                ctx.add_class('dccb-tile-hover')
+                ctx.add_class(self.box_window.css_hover_class)
                 self.set_opacity(0.35)
             except Exception:
                 pass
@@ -1177,6 +1375,9 @@ class IconTile(Gtk.EventBox):
             pass
         if remove_hover:
             try:
+                ctx = self.visual_box.get_style_context() if getattr(self, 'visual_box', None) is not None else self.get_style_context()
+                ctx.remove_class('dccb-tile-hover')
+                ctx.remove_class(self.box_window.css_hover_class)
                 self.get_style_context().remove_class('dccb-tile-hover')
                 self.get_style_context().remove_class(self.box_window.css_hover_class)
             except Exception:
@@ -1242,13 +1443,6 @@ class IconTile(Gtk.EventBox):
 
 
     def _load_drag_pixbuf(self, size: int = 48):
-        try:
-            if self.path.is_file():
-                content = Gio.content_type_guess(str(self.path), None)[0]
-                if content and content.startswith('image/'):
-                    return GdkPixbuf.Pixbuf.new_from_file_at_scale(str(self.path), size, size, True)
-        except Exception:
-            pass
         return display_icon_pixbuf_for_path(self.path, size)
 
     def _on_drag_begin(self, _widget, context):
@@ -1303,6 +1497,7 @@ class DesktopBoxWindow(Gtk.Window):
         self.css_title_class = f'dccb-title-{safe_id}'
         self.css_label_class = f'dccb-label-{safe_id}'
         self.css_hover_class = f'dccb-hover-{safe_id}'
+        self.css_selected_class = f'dccb-selected-{safe_id}'
         self.folder = Path(settings['folder']).expanduser()
         self.folder.mkdir(parents=True, exist_ok=True)
         self._configure_timer = None
@@ -1310,6 +1505,12 @@ class DesktopBoxWindow(Gtk.Window):
         self._folder_monitor = None
         self._suppress_config = False
         self._tiles = {}
+        self._selected_tile = None
+        self._selected_names = set()
+        self._last_selected_name = None
+        self._resize_snap_timer = None
+        self._resize_snap_enabled = False
+        self._last_config_size = None
 
         self.set_decorated(False)
         self.set_skip_taskbar_hint(True)
@@ -1342,6 +1543,12 @@ class DesktopBoxWindow(Gtk.Window):
         self.move(int(settings.get('x', DEFAULTS['x'])), int(settings.get('y', DEFAULTS['y'])))
         self.connect('configure-event', self._on_configure)
         self.connect('delete-event', self._on_delete)
+        self.connect('focus-out-event', self._on_focus_out)
+        self.connect('key-press-event', self._on_key_press)
+        try:
+            self.set_accept_focus(True)
+        except Exception:
+            pass
 
         self._build_ui()
         self._apply_css()
@@ -1350,6 +1557,33 @@ class DesktopBoxWindow(Gtk.Window):
         self.add_drop_target(self)
         self.show_all()
         self._apply_workspace_behavior(later=True)
+        GLib.timeout_add(800, self._enable_resize_snap)
+
+    def _enable_resize_snap(self):
+        self._resize_snap_enabled = True
+        try:
+            self._last_config_size = self.get_size()
+        except Exception:
+            self._last_config_size = (int(self.settings.get('width', DEFAULTS['width'])), int(self.settings.get('height', DEFAULTS['height'])))
+        return False
+
+    def _on_focus_out(self, *_args):
+        # Match desktop behavior: selection is cleared when the box loses focus.
+        try:
+            self.clear_icon_selection()
+        except Exception:
+            pass
+        return False
+
+    def _on_key_press(self, _widget, event):
+        try:
+            key = Gdk.keyval_name(event.keyval) or ''
+        except Exception:
+            key = ''
+        if key == 'Escape':
+            self.clear_icon_selection()
+            return True
+        return False
 
     def _apply_workspace_behavior(self, later=True, remember_current=False):
         """Apply the per-workspace checkbox for this box.
@@ -1479,11 +1713,138 @@ class DesktopBoxWindow(Gtk.Window):
         self.fixed.set_margin_start(8)
         self.fixed.set_margin_end(8)
         self.viewport.add(self.fixed)
+        self.viewport.connect('button-press-event', self._on_canvas_press)
+        self.fixed.connect('button-press-event', self._on_canvas_press)
 
         self.add_drop_target(self.outer)
         self.add_drop_target(self.title_bar)
         self.add_drop_target(self.viewport)
         self.add_drop_target(self.fixed)
+
+    def _on_canvas_press(self, _widget, event):
+        if getattr(event, 'button', None) == 1:
+            try:
+                self.app.clear_all_icon_selections()
+            except Exception:
+                self.clear_icon_selection()
+        return False
+
+    def _visible_tile_names(self):
+        return [p.name for p in self._visible_entries() if p.name in self._tiles]
+
+    def is_tile_selected(self, tile):
+        try:
+            return tile is not None and tile.path.name in self._selected_names
+        except Exception:
+            return False
+
+    def selected_tiles(self):
+        tiles = []
+        try:
+            for name in list(self._selected_names):
+                tile = self._tiles.get(name)
+                if tile is not None:
+                    tiles.append(tile)
+        except Exception:
+            pass
+        return tiles
+
+    def select_tile(self, tile, event=None):
+        try:
+            if tile is None:
+                self.clear_icon_selection()
+                return
+            try:
+                self.app.clear_all_icon_selections(except_window=self)
+            except Exception:
+                pass
+            state = int(getattr(event, 'state', 0) or 0)
+            ctrl = bool(state & int(Gdk.ModifierType.CONTROL_MASK))
+            shift = bool(state & int(Gdk.ModifierType.SHIFT_MASK))
+            name = tile.path.name
+
+            if shift and self._last_selected_name in self._tiles:
+                order = self._visible_tile_names()
+                try:
+                    a = order.index(self._last_selected_name)
+                    b = order.index(name)
+                    lo, hi = sorted((a, b))
+                    if not ctrl:
+                        self.clear_icon_selection()
+                    for n in order[lo:hi + 1]:
+                        t = self._tiles.get(n)
+                        if t is not None:
+                            self._selected_names.add(n)
+                            t.set_selected(True)
+                    self._selected_tile = tile
+                    return
+                except Exception:
+                    pass
+
+            if ctrl:
+                if name in self._selected_names:
+                    self._selected_names.discard(name)
+                    tile.set_selected(False)
+                    if self._selected_tile is tile:
+                        self._selected_tile = None
+                else:
+                    self._selected_names.add(name)
+                    tile.set_selected(True)
+                    self._selected_tile = tile
+                    self._last_selected_name = name
+                return
+
+            self.clear_icon_selection()
+            self._selected_names.add(name)
+            self._selected_tile = tile
+            self._last_selected_name = name
+            tile.set_selected(True)
+        except Exception:
+            pass
+
+    def clear_icon_selection(self):
+        try:
+            for name in list(getattr(self, '_selected_names', set())):
+                tile = self._tiles.get(name)
+                if tile is not None:
+                    tile.set_selected(False)
+            self._selected_names = set()
+            self._selected_tile = None
+        except Exception:
+            pass
+
+    def show_item_menu(self, tile, event):
+        selected_tiles = self.selected_tiles()
+        if tile not in selected_tiles:
+            selected_tiles = [tile]
+        paths = [t.path for t in selected_tiles if t is not None and t.path.exists()]
+        if not paths:
+            paths = [tile.path]
+        single = len(paths) == 1
+        path = paths[0]
+        menu = Gtk.Menu()
+
+        def add(label, callback, sensitive=True):
+            item = Gtk.MenuItem(label=label)
+            item.set_sensitive(bool(sensitive))
+            item.connect('activate', callback)
+            menu.append(item)
+            return item
+
+        add('Open', lambda *_: [open_path(p) for p in paths], sensitive=bool(paths))
+        add('Open With...', lambda *_: self.open_with_dialog(path), sensitive=single)
+        menu.append(Gtk.SeparatorMenuItem())
+        add('Cut', lambda *_: set_file_clipboard(paths, cut=True), sensitive=bool(paths))
+        add('Copy', lambda *_: set_file_clipboard(paths, cut=False), sensitive=bool(paths))
+        menu.append(Gtk.SeparatorMenuItem())
+        add('Rename...', lambda *_: self.rename_item_dialog(path), sensitive=single)
+        add('Move to Desktop', lambda *_: [self.move_item_to_desktop(p) for p in list(paths)], sensitive=bool(paths))
+        add('Move to Trash', lambda *_: [self.trash_item(p) for p in list(paths)], sensitive=bool(paths))
+        menu.append(Gtk.SeparatorMenuItem())
+        add('Open Containing Folder', lambda *_: open_path(path.parent), sensitive=single)
+        add('Properties', lambda *_: self.properties_dialog(path), sensitive=single)
+        menu.show_all()
+        menu.popup_at_pointer(event)
 
     def _add_resize_grip(self, col, row, edge, cursor_name):
         grip = Gtk.EventBox()
@@ -1523,9 +1884,11 @@ class DesktopBoxWindow(Gtk.Window):
 
     def _on_title_press(self, _widget, event):
         if event.button == 1 and event.type == Gdk.EventType.DOUBLE_BUTTON_PRESS:
+            self.app.clear_all_icon_selections()
             self.rename_dialog()
             return True
         if event.button == 1:
+            self.app.clear_all_icon_selections()
             gdk_window = self.get_window()
             if gdk_window:
                 gdk_window.begin_move_drag(event.button, int(event.x_root), int(event.y_root), event.time)
@@ -1589,9 +1952,21 @@ class DesktopBoxWindow(Gtk.Window):
         .dccb-icon-label.{self.css_label_class} {{
             color: {rgba_css(self.settings.get('label_color'), DEFAULTS['label_color'])};
         }}
+        .dccb-tile, .dccb-tile * {{
+            background-color: transparent;
+            background-image: none;
+        }}
+        .dccb-tile-visual {{
+            padding: 3px 4px 2px 4px;
+        }}
         .dccb-tile-hover.{self.css_hover_class} {{
             background-color: {rgba_css(self.settings.get('hover'), DEFAULTS['hover'])};
-            border-radius: 8px;
+            border-radius: 7px;
+        }}
+        .dccb-tile-selected.{self.css_selected_class} {{
+            background-color: {rgba_css(self.settings.get('selection'), DEFAULTS['selection'])};
+            border: 1px solid {rgba_css(self.settings.get('border'), DEFAULTS['border'])};
+            border-radius: 7px;
         }}
         '''
         provider = Gtk.CssProvider()
@@ -1718,6 +2093,7 @@ class DesktopBoxWindow(Gtk.Window):
             return []
 
     def refresh_icons(self):
+        self.clear_icon_selection()
         for child in list(self.fixed.get_children()):
             self.fixed.remove(child)
         self._tiles = {}
@@ -1787,9 +2163,7 @@ class DesktopBoxWindow(Gtk.Window):
         # Find the nearest open grid cell, like a desktop icon grid would.
         canvas_w, canvas_h = canvas_size_for_settings(self.settings)
         step_x, step_y = self._tile_step()
-        icon = int(self.settings.get('icon_size', DEFAULTS['icon_size']))
-        tile_w = max(80, icon + 38)
-        tile_h = max(82, icon + 54)
+        tile_w, tile_h, _sx, _sy, _icon = tile_geometry_for_settings(self.settings)
         max_gx = max(0, (canvas_w - tile_w - GRID_MARGIN_X) // step_x)
         max_gy = max(0, (canvas_h - tile_h - GRID_MARGIN_Y) // step_y)
         bx, by = base
@@ -1844,6 +2218,143 @@ class DesktopBoxWindow(Gtk.Window):
             self.viewport.set_size_request(1, 1)
         except Exception:
             pass
+
+    def _canvas_axis_for_cells(self, cells, tile_extent, step, margin):
+        cells = max(1, int(cells))
+        return int((margin * 2) + tile_extent + ((cells - 1) * step))
+
+    def _nearest_snapped_canvas_axis(self, value, tile_extent, step, margin):
+        value = int(value)
+        minimum = self._canvas_axis_for_cells(1, tile_extent, step, margin)
+        if value <= minimum:
+            return minimum
+        cells = int(round((value - minimum) / float(step))) + 1
+        return self._canvas_axis_for_cells(cells, tile_extent, step, margin)
+
+    def _ceil_snapped_canvas_axis(self, required, tile_extent, step, margin):
+        import math
+        required = int(required)
+        minimum = self._canvas_axis_for_cells(1, tile_extent, step, margin)
+        if required <= minimum:
+            return minimum
+        cells = int(math.ceil((required - minimum) / float(step))) + 1
+        return self._canvas_axis_for_cells(cells, tile_extent, step, margin)
+
+    def _tile_root_position(self, name, fallback_x, fallback_y):
+        """Return the tile's current desktop/root position for resize exports.
+
+        Resize-export should place the file where its icon visually was on the
+        screen.  Use the fixed icon canvas origin plus the saved grid position
+        first; that is more stable than translating through the borderless top
+        level window on Cinnamon/Muffin.
+        """
+        try:
+            fx, fy = gdk_origin_xy(self.fixed.get_window())
+            return int(fx + int(fallback_x)), int(fy + int(fallback_y))
+        except Exception:
+            pass
+        try:
+            tile = self._tiles.get(name)
+            if tile is not None:
+                translated = tile.translate_coordinates(self.fixed, 0, 0)
+                if translated is not None:
+                    local_x, local_y = translated
+                    fx, fy = gdk_origin_xy(self.fixed.get_window())
+                    return int(fx + local_x), int(fy + local_y)
+        except Exception:
+            pass
+        try:
+            ox, oy = gdk_origin_xy(self.get_window())
+            ox_rel, oy_rel = self._fixed_offset_in_window()
+            return int(ox + ox_rel + int(fallback_x)), int(oy + oy_rel + int(fallback_y))
+        except Exception:
+            return int(fallback_x), int(fallback_y)
+
+    def _schedule_resize_grid_finalize(self):
+        if not getattr(self, '_resize_snap_enabled', False):
+            return
+        if self._resize_snap_timer:
+            try:
+                GLib.source_remove(self._resize_snap_timer)
+            except Exception:
+                pass
+            self._resize_snap_timer = None
+        self._resize_snap_timer = GLib.timeout_add(RESIZE_GRID_SETTLE_MS, self._finalize_resize_grid)
+
+    def _finalize_resize_grid(self):
+        self._resize_snap_timer = None
+        if not getattr(self, '_resize_snap_enabled', False):
+            return False
+        try:
+            current_w, current_h = self.get_size()
+        except Exception:
+            current_w = int(self.settings.get('width', DEFAULTS['width']))
+            current_h = int(self.settings.get('height', DEFAULTS['height']))
+        current_w, current_h = clamp_size(current_w, current_h)
+        raw_canvas_w = max(100, int(current_w) - 32)
+        raw_canvas_h = max(80, int(current_h) - 62)
+        grid_tile_w, grid_tile_h, step_x, step_y, _icon = tile_geometry_for_settings(self.settings)
+        visible_tile_w, visible_tile_h, _sx, _sy, _icon2 = tile_visible_geometry_for_settings(self.settings)
+        tile_w, tile_h = visible_tile_w, visible_tile_h
+
+        # Start with a snapped grid boundary. If the edge cuts through an icon,
+        # expand to the next grid boundary that fully contains it. If the edge is
+        # before that icon's cell starts, export it to the Desktop instead.
+        required_w = self._nearest_snapped_canvas_axis(raw_canvas_w, tile_w, step_x, GRID_MARGIN_X)
+        required_h = self._nearest_snapped_canvas_axis(raw_canvas_h, tile_h, step_y, GRID_MARGIN_Y)
+        to_export = []
+        positions = self.settings.setdefault('positions', {})
+        for path in self._visible_entries():
+            pos = positions.get(path.name)
+            if not isinstance(pos, dict):
+                continue
+            try:
+                x = int(pos.get('x', GRID_MARGIN_X))
+                y = int(pos.get('y', GRID_MARGIN_Y))
+            except Exception:
+                continue
+            # Fully outside the resized edge: remove from the box.
+            # If the new edge intersects the visible icon/label area, snap outward
+            # instead of exporting it. Only export once the edge is before the
+            # icon's visible grid start.
+            if x >= raw_canvas_w or y >= raw_canvas_h:
+                rx, ry = self._tile_root_position(path.name, x, y)
+                to_export.append((path, rx, ry))
+                continue
+            # Partially clipped: snap the box outward to include the whole grid cell.
+            required_w = max(required_w, self._ceil_snapped_canvas_axis(x + tile_w + GRID_MARGIN_X, tile_w, step_x, GRID_MARGIN_X))
+            required_h = max(required_h, self._ceil_snapped_canvas_axis(y + tile_h + GRID_MARGIN_Y, tile_h, step_y, GRID_MARGIN_Y))
+
+        snapped_w, snapped_h = clamp_size(required_w + 32, required_h + 62)
+        changed = False
+        if int(snapped_w) != int(current_w) or int(snapped_h) != int(current_h):
+            self.settings['width'] = int(snapped_w)
+            self.settings['height'] = int(snapped_h)
+            try:
+                self._suppress_config = True
+                self.resize(int(snapped_w), int(snapped_h))
+            except Exception:
+                pass
+            finally:
+                self._suppress_config = False
+            changed = True
+
+        if to_export:
+            for path, rx, ry in to_export:
+                try:
+                    if path.exists() and path.parent == self.folder:
+                        self.settings.setdefault('positions', {}).pop(path.name, None)
+                        dest = move_path_to(path, DESKTOP_DIR)
+                        set_nemo_icon_position(dest, rx, ry, self.settings.get('icon_size', DEFAULTS['icon_size']))
+                        changed = True
+                except Exception as e:
+                    print(f'{APP_ID}: resize export failed: {e}', file=sys.stderr, flush=True)
+            self.refresh_later()
+
+        if changed:
+            self._resize_canvas_to_fit()
+            self.app.save()
+        return False
 
     def root_rect_candidates(self):
         """Return possible root-coordinate rectangles for this box.
@@ -2022,6 +2533,9 @@ class DesktopBoxWindow(Gtk.Window):
         self.settings['x'] = int(event.x)
         self.settings['y'] = int(event.y)
         w, h = clamp_size(event.width, event.height)
+        old_w = int(self.settings.get('width', w))
+        old_h = int(self.settings.get('height', h))
+        size_changed = (int(w) != old_w or int(h) != old_h)
         self.settings['width'] = w
         self.settings['height'] = h
         # Most window managers obey the max geometry hints and show the cap live.
@@ -2029,6 +2543,8 @@ class DesktopBoxWindow(Gtk.Window):
         # instead of fighting the live resize and snapping back to the old size.
         if int(event.width) > MAX_BOX_WIDTH or int(event.height) > MAX_BOX_HEIGHT:
             GLib.timeout_add(120, self._enforce_max_size, w, h)
+        if size_changed:
+            self._schedule_resize_grid_finalize()
         self._resize_canvas_to_fit()
         self.save_later()
         return False
@@ -2103,6 +2619,7 @@ class DesktopBoxWindow(Gtk.Window):
             ('title_color', 'Title text'),
             ('label_color', 'Icon labels'),
             ('hover', 'Hover highlight'),
+            ('selection', 'Selection highlight'),
         ]
         grid.attach(Gtk.Label(label='Color', xalign=0), 1, 0, 1, 1)
         grid.attach(Gtk.Label(label='Opacity', xalign=0), 2, 0, 1, 1)
@@ -2196,6 +2713,77 @@ class DesktopBoxWindow(Gtk.Window):
                     pass
         dialog.destroy()
 
+
+    def open_with_dialog(self, path: Path):
+        try:
+            gfile = Gio.File.new_for_path(str(path))
+            dialog = Gtk.AppChooserDialog.new(self, Gtk.DialogFlags.MODAL, gfile)
+            dialog.set_heading(f'Open “{path.name}” with')
+            response = dialog.run()
+            if response == Gtk.ResponseType.OK:
+                app_info = dialog.get_app_info()
+                if app_info:
+                    app_info.launch([gfile], None)
+            dialog.destroy()
+        except Exception:
+            open_path(path)
+
+    def rename_item_dialog(self, path: Path):
+        try:
+            dialog = Gtk.Dialog(title='Rename Item', transient_for=self, flags=Gtk.DialogFlags.MODAL)
+            dialog.add_button('Cancel', Gtk.ResponseType.CANCEL)
+            dialog.add_button('Rename', Gtk.ResponseType.OK)
+            area = dialog.get_content_area()
+            area.set_margin_top(12)
+            area.set_margin_bottom(12)
+            area.set_margin_start(12)
+            area.set_margin_end(12)
+            entry = Gtk.Entry()
+            entry.set_text(path.name)
+            entry.set_activates_default(True)
+            area.add(entry)
+            dialog.set_default_response(Gtk.ResponseType.OK)
+            dialog.show_all()
+            response = dialog.run()
+            new_name = entry.get_text().strip()
+            dialog.destroy()
+            if response != Gtk.ResponseType.OK or not new_name or new_name == path.name:
+                return
+            dest = unique_dest(path.parent, new_name)
+            icon_metadata = read_custom_icon_metadata(path)
+            shutil.move(str(path), str(dest))
+            apply_custom_icon_metadata(dest, icon_metadata)
+            positions = self.settings.setdefault('positions', {})
+            if path.name in positions:
+                positions[dest.name] = positions.pop(path.name)
+            self.app.save()
+            self.refresh_icons()
+        except Exception as e:
+            print(f'{APP_ID}: rename item failed: {e}', file=sys.stderr, flush=True)
+
+    def properties_dialog(self, path: Path):
+        try:
+            stat = path.stat()
+            kind = 'Folder' if path.is_dir() else 'File'
+            size_text = '—' if path.is_dir() else f'{stat.st_size:,} bytes'
+            modified = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime))
+            dialog = Gtk.MessageDialog(
+                transient_for=self,
+                flags=Gtk.DialogFlags.MODAL,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.CLOSE,
+                text=path.name,
+            )
+            dialog.format_secondary_text(
+                f'Type: {kind}\n'
+                f'Location: {path.parent}\n'
+                f'Size: {size_text}\n'
+                f'Modified: {modified}'
+            )
+            dialog.run()
+            dialog.destroy()
+        except Exception:
+            pass
 
     def move_item_to_desktop(self, path: Path, root_x=None, root_y=None):
         try:
@@ -2367,6 +2955,15 @@ class DesktopCommentBoxApp:
         # stale synced-window state from older builds before creating/removing boxes.
         self.config = repair_config(self.config)
         return self.config
+
+    def clear_all_icon_selections(self, except_window=None):
+        for win in list(self.windows.values()):
+            try:
+                if except_window is not None and win is except_window:
+                    continue
+                win.clear_icon_selection()
+            except Exception:
+                pass
 
     def box_at_root(self, root_x, root_y, margin=0):
         # Return the topmost live comment box under the pointer.  This is used

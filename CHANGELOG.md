@@ -1,11 +1,50 @@
+# Changelog
+
+## v1.4.19
+
+- Adds resize-to-grid cleanup behavior.
+- When a box is resized smaller and an icon grid cell is fully outside the new box area, that item is moved back to the Desktop near its current screen position.
+- When the resized edge lands partway through an icon tile, the box snaps outward to the next grid boundary so the icon stays enclosed.
+- Box resizing now settles on desktop-style icon grid boundaries.
+
+## v1.4.17
+
+- Tightened icon selection and hover highlight geometry.
+- Selection highlight now wraps only the icon and filename content instead of stretching through the full grid cell.
+- Kept fixed grid spacing and thumbnail behavior from v1.4.16.
+
+## v1.4.16
+
+- Fixed tile backgrounds turning white after icons were unselected.
+- Clearing selection now also clears stale hover/highlight classes.
+- Added explicit transparent base styling for icon tiles to avoid GTK theme fallback backgrounds.
+
+# Changelog
+
+## v1.4.15
+
+- Fixes item selection clearing when clicking blank space/header or when the box loses focus.
+- Adds Ctrl-click selection toggling.
+- Adds Shift-click range selection.
+- Adds configurable selection highlight color in Configure Appearance.
+- Makes right-click item actions respect multi-selected files where appropriate.
+- Makes icon tiles fixed-size so long filenames no longer affect grid placement.
+- Makes icon layout uniform by scaling thumbnails/icons into a fixed square icon area.
+
+## v1.4.14
+
+- Adds visible selection highlighting for items inside comment boxes.
+- Adds a fuller right-click item menu with Open, Open With, Cut, Copy, Rename, Move to Desktop, Move to Trash, Open Containing Folder, and Properties.
+- Adds image thumbnails for image files inside boxes and drag previews.
+- Adds video thumbnail support from existing thumbnail cache, with optional generation when `ffmpegthumbnailer` is installed.
+
 ## v1.4.13
 
 - Preserves Nemo/GVFS custom icon metadata when moving files or folders between boxes or back to the Desktop.
 - Fixes exported folders losing their custom icon after being dragged out of a comment box.
 
-# Changelog
-
 ## v1.4.12
+
 - Respect custom folder icons set through Nemo/Gio metadata.
 - Respect `.directory` Icon= custom folder icons where present.
 - Use the same custom icon lookup for normal display icons and drag previews.

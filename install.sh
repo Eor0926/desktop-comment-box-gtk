@@ -113,6 +113,11 @@ find "$HOME/Desktop" "$HOME/.local/share/applications" -maxdepth 1 -type f -name
 update-desktop-database "$APP_DESKTOP_DIR" >/dev/null 2>&1 || true
 nemo -q >/dev/null 2>&1 || true
 
+if ! command -v ffmpegthumbnailer >/dev/null 2>&1; then
+  echo "Optional: install ffmpegthumbnailer for generated video thumbnails:"
+  echo "  sudo apt install -y ffmpegthumbnailer"
+fi
+
 cat <<EOF2
 Installed Desktop Comment Box GTK.
 Run it with: desktop-comment-box
